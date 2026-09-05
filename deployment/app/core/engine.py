@@ -377,7 +377,13 @@ class DenoiseEngine:
             if arr.ndim == 1:
                 arr = arr.reshape(1, -1)
 
-            target_sr = int(sample_rate or self.cfg.denoise.sample_rate or input_sr or slot.sampling_rate)
+            # 推理结果的采样率 = 模型标称采样率。
+            # 原工程 DataReader.audioread() 在采样率不匹配时会先用 librosa 把输入
+            # 重采样到 args.sampling_rate，因此模型输出与【模型】采样率对齐，
+            # 而不是与输入采样率对齐（dataloader.py 的 audioread 中有对应实现）。
+            # 随后再按 target_sr 重采样回输入采样率，保证"进什么格式出什么格式"。
+            result_sr = int(slot.sampling_rate)
+            target_sr = int(sample_rate or self.cfg.denoise.sample_rate or input_sr or result_sr)
             target_ch = int(channels or self.cfg.denoise.channels or input_channels or 1)
             target_br = bitrate or self.cfg.denoise.bitrate or (
                 f"{int(info.get('bit_rate') or 0) // 1000}k" if info.get("bit_rate") else None
@@ -386,7 +392,7 @@ class DenoiseEngine:
 
             encode_info = audio_io.encode_audio(
                 arr,
-                slot.sampling_rate,
+                result_sr,
                 out_path,
                 ext,
                 target_sample_rate=target_sr,

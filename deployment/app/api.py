@@ -48,9 +48,10 @@ class Task:
 
 
 class TaskManager:
-    def __init__(self, ttl_seconds: int, max_tasks: int, logger):
+    def __init__(self, ttl_seconds: int, max_tasks: int, temp_root: str, logger):
         self._ttl = max(60, int(ttl_seconds))
         self._max_tasks = max(10, int(max_tasks))
+        self._temp_root = temp_root
         self._logger = logger
         self._tasks: Dict[str, Task] = {}
         self._lock = threading.Lock()
@@ -86,7 +87,7 @@ class TaskManager:
             task = self._tasks.pop(task_id, None)
         if not task:
             return False
-        shutil.rmtree(task.workdir, ignore_errors=True)
+        safe_rmtree(task.workdir, self._temp_root, self._logger)
         return True
 
     def _evict_locked(self, force: bool = False) -> None:
@@ -102,7 +103,7 @@ class TaskManager:
         for tid in expired:
             task = self._tasks.pop(tid, None)
             if task:
-                shutil.rmtree(task.workdir, ignore_errors=True)
+                safe_rmtree(task.workdir, self._temp_root, self._logger)
 
     def _clean_loop(self) -> None:
         while not self._stop.wait(30.0):
@@ -116,7 +117,7 @@ class TaskManager:
         self._stop.set()
         with self._lock:
             for task in list(self._tasks.values()):
-                shutil.rmtree(task.workdir, ignore_errors=True)
+                safe_rmtree(task.workdir, self._temp_root, self._logger)
             self._tasks.clear()
 
 
@@ -136,7 +137,7 @@ class ServiceContext:
             max_queue_size=cfg.concurrency.max_queue_size,
             logger=logger,
         )
-        self.tasks = TaskManager(cfg.server.task_ttl_s, cfg.server.max_tasks, logger)
+        self.tasks = TaskManager(cfg.server.task_ttl_s, cfg.server.max_tasks, cfg.audio.temp_dir, logger)
         self.engine = DenoiseEngine(cfg, self.governor, logger)
         self.ready = False
         self.fatal_error: Optional[str] = None
@@ -164,8 +165,24 @@ class ServiceContext:
 # ---------------------------------------------------------------------------
 
 
-def _cleanup_dir(path: str) -> None:
-    shutil.rmtree(path, ignore_errors=True)
+def safe_rmtree(path: str, allowed_root: str, logger) -> None:
+    """只删除 allowed_root 之下的目录。
+
+    临时目录名虽由服务端生成，清理时仍要做边界校验：
+    一旦路径因故变成空串或脱离工作根目录，绝不能顺着删下去。
+    """
+    if not path or not isinstance(path, str):
+        return
+    target = os.path.abspath(path)
+    root = os.path.abspath(allowed_root)
+    try:
+        if os.path.commonpath([target, root]) != root:
+            logger.warning("拒绝删除非工作目录: %s（允许范围 %s）", target, root)
+            return
+    except ValueError:
+        logger.warning("无法校验待删除路径: %s", target)
+        return
+    shutil.rmtree(target, ignore_errors=True)
 
 
 class Pipeline:
@@ -242,6 +259,10 @@ def build_app(cfg, logger) -> FastAPI:
     ctx = ServiceContext(cfg, logger)
     pipeline = Pipeline(ctx)
     api_key = cfg.server.api_key or ""
+    temp_root = cfg.audio.temp_dir
+
+    def _cleanup_dir(path: str) -> None:
+        safe_rmtree(path, temp_root, logger)
 
     PUBLIC_PATHS = {"/", "/health", "/ready", "/docs", "/redoc", "/openapi.json"}
 

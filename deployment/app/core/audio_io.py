@@ -256,29 +256,44 @@ def encode_audio(
     }
 
 
+def _fit_length(data: np.ndarray, target_len: int) -> np.ndarray:
+    """把 (C, T) 的时间轴对齐到 target_len，保证各声道长度一致"""
+    cur = data.shape[1]
+    if cur == target_len:
+        return data
+    if cur > target_len:
+        return np.ascontiguousarray(data[:, :target_len])
+    pad = ((0, 0), (0, target_len - cur))
+    return np.ascontiguousarray(np.pad(data, pad))
+
+
 def _resample(pcm: np.ndarray, src_sr: int, dst_sr: int) -> np.ndarray:
-    """重采样，按 soxr > librosa > scipy 的优先级选择实现"""
+    """重采样，按 librosa(soxr 后端) > scipy > 线性插值 的优先级选择实现。
+
+    重要：绝不能直接对形状为 (声道数, 采样点数) 的二维数组调用 soxr.resample。
+    soxr 的默认 axis 是 0（而非 -1），会沿"声道轴"重采样：
+      * 单声道 (1, N) 时长度 1 被缩放到 0，触发原生崩溃（0xC0000005，进程直接死）；
+      * 双声道 (2, N) 时输出形状会变成 (1, N)，结果完全错乱。
+    因此所有分支都必须沿 axis=1（时间轴）或逐通道处理。
+    """
     if src_sr == dst_sr:
         return pcm
+    if pcm.ndim != 2:
+        raise AudioError(f"重采样输入必须是二维 (声道, 采样点)，实际 {pcm.shape}")
+
+    target_len = max(1, int(round(pcm.shape[1] * dst_sr / float(src_sr))))
     errors = []
-
-    try:
-        import soxr
-
-        out = soxr.resample(pcm.astype(np.float32), src_sr, dst_sr)
-        return np.ascontiguousarray(out, dtype=np.float32)
-    except Exception as exc:
-        errors.append(f"soxr: {exc}")
 
     try:
         import librosa
 
-        out = np.empty(
-            (pcm.shape[0], int(round(pcm.shape[1] * dst_sr / float(src_sr)))), dtype=np.float32
-        )
+        out = np.empty((pcm.shape[0], target_len), dtype=np.float32)
         for i in range(pcm.shape[0]):
-            out[i] = librosa.resample(pcm[i], orig_sr=src_sr, target_sr=dst_sr).astype(np.float32)
-        return out
+            out[i] = _fit_length(
+                librosa.resample(pcm[i], orig_sr=src_sr, target_sr=dst_sr).astype(np.float32).reshape(1, -1),
+                target_len,
+            )[0]
+        return np.ascontiguousarray(out, dtype=np.float32)
     except Exception as exc:
         errors.append(f"librosa: {exc}")
 
@@ -290,9 +305,19 @@ def _resample(pcm: np.ndarray, src_sr: int, dst_sr: int) -> np.ndarray:
         g = gcd(int(src_sr), int(dst_sr))
         up, down = int(dst_sr) // g, int(src_sr) // g
         out = resample_poly(pcm.astype(np.float64), up, down, axis=1)
-        return np.ascontiguousarray(out, dtype=np.float32)
+        return _fit_length(np.ascontiguousarray(out, dtype=np.float32), target_len)
     except Exception as exc:
         errors.append(f"scipy: {exc}")
+
+    try:
+        src_idx = np.arange(pcm.shape[1], dtype=np.float64)
+        dst_idx = np.linspace(0, max(1, pcm.shape[1] - 1), target_len)
+        out = np.stack(
+            [np.interp(dst_idx, src_idx, pcm[i].astype(np.float64)) for i in range(pcm.shape[0])]
+        )
+        return np.ascontiguousarray(out, dtype=np.float32)
+    except Exception as exc:
+        errors.append(f"interp: {exc}")
 
     raise AudioError(f"重采样失败 {src_sr}->{dst_sr} ({'; '.join(errors)})")
 
