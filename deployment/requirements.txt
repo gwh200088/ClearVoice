@@ -1,0 +1,23 @@
+# 使用国内镜像可临时改为：-e PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple
+# 注意：torch / torchaudio 由 Dockerfile 通过 --index-url 单独安装，此处不再声明
+fastapi>=0.110,<0.116
+uvicorn[standard]>=0.27,<0.31
+python-multipart>=0.0.9
+pydantic>=2.5,<3.0
+PyYAML>=6.0
+psutil>=5.9
+
+# --- 以下为 ClearerVoice-Studio 推理所需依赖（已去掉训练/评测相关的大件） ---
+numpy>=1.24.3,<2.0
+scipy>=1.10.1
+librosa==0.10.2.post1
+soundfile==0.12.1
+pydub>=0.25.1
+joblib>=1.3
+packaging>=23.0
+tqdm>=4.66
+yamlargparse>=1.31.1
+einops>=0.7
+torchinfo>=1.8.0
+rotary-embedding-torch>=0.5.3
+python_speech_features==0.6

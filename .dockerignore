@@ -1,0 +1,22 @@
+# 减小构建上下文（Docker 18.09 的经典构建器会全量传输上下文）
+.git
+.gitignore
+**/__pycache__
+**/*.pyc
+**/*.pyo
+train
+speechscore
+asset
+clearvoice/samples
+deployment/logs
+deployment/tmp
+**/*.onnx
+**/*.pt
+**/*.pth
+*.md
+
+# 导出的镜像 tar 包等离线交付产物：绝不能进构建上下文（动辄几 GB）
+offline-artifacts
+deployment/offline-artifacts
+**/*.tar
+**/*.tar.gz

@@ -1,0 +1,6 @@
+# Shell 脚本要在 Linux 容器内执行，必须保持 LF。
+# 否则 Windows 上 core.autocrlf=true 会把它们转成 CRLF，
+# 拷到 Linux 执行时报 bad interpreter: /bin/bash^M
+*.sh text eol=lf
+deployment/entrypoint.sh text eol=lf
+deployment/tools/*.sh text eol=lf

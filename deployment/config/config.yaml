@@ -1,0 +1,96 @@
+server:
+  host: 0.0.0.0
+  port: 8000
+  root_path: ""
+  # 留空表示不鉴权；设置后需在请求头携带 X-API-Key 或 Authorization: Bearer <key>
+  api_key: ""
+  max_upload_mb: 300
+  sync_timeout_s: 900.0
+  task_ttl_s: 1800
+  max_tasks: 2000
+
+runtime:
+  # auto | cpu | cuda | cuda:N
+  device: auto
+  # 限制本进程可见的 GPU（等价于 CUDA_VISIBLE_DEVICES），留空表示使用全部可见 GPU
+  gpu_ids: ""
+  # 降噪默认模型：FRCRN_SE_16K | MossFormerGAN_SE_16K | MossFormer2_SE_48K
+  model: MossFormerGAN_SE_16K
+  # 按输入采样率自动选模型（>=32kHz 用 MossFormer2_SE_48K，否则用 runtime.model）
+  auto_select_model: true
+  # 模型实例数（每个实例独占一把锁，决定真正可并行的推理路数）
+  model_pool_size: 2
+  torch_threads: 4
+  allow_tf32: true
+  preload: true
+  # 0 表示沿用模型 yaml 里的默认值；>0 用于降低单段解码长度从而压低显存峰值
+  decode_window_s: 0.0
+  one_time_decode_length_s: 0.0
+  # 0 表示不设置硬上限；>0 时调用 torch.cuda.set_per_process_memory_fraction 兜底
+  process_memory_ratio: 0.0
+
+concurrency:
+  max_concurrency: 2
+  max_queue_size: 64
+  queue_timeout_s: 600.0
+
+resource:
+  poll_interval_ms: 200
+  gpu:
+    enabled: true
+    reserve_mb: 512
+    per_task_mb: 1024
+    max_usage_ratio: 0.90
+    # 关键：true 时把 PyTorch 缓存池中"占着但没在用"的显存视为可用（区分显示占用与真实占用）
+    count_cached_as_free: true
+    empty_cache_when_idle: true
+    empty_cache_min_interval_s: 10.0
+  cpu:
+    enabled: true
+    reserve_mb: 1024
+    per_task_mb: 1024
+    max_usage_ratio: 0.85
+
+denoise:
+  auto_detect: true
+  # 估算 SNR 低于该阈值才做降噪，否则原样返回
+  snr_threshold_db: 25.0
+  noise_percentile: 10.0
+  speech_percentile: 90.0
+  frame_ms: 20.0
+  # 噪声检测最多分析的音频秒数（从头/中/尾各取 1/3），0 表示分析整段
+  analyze_max_seconds: 45.0
+  min_speech_ratio: 0.01
+  min_duration_s: 0.2
+  # 输出码率，如 128k；留空表示跟随输入码率（探测不到时 mp3/m4a 兜底 128k）
+  bitrate: ""
+  # 输出采样率，0 表示跟随输入
+  sample_rate: 0
+  # 输出声道数，0 表示跟随输入；1/2 强制单/双声道
+  channels: 0
+
+audio:
+  allowed_formats: [mp3, wav, m4a]
+  temp_dir: /tmp/clearvoice
+  probe_timeout_s: 20.0
+  encode_timeout_s: 300.0
+  decode_timeout_s: 120.0
+
+models:
+  root: /opt/models/ClearerVoice-Studio
+  # 容器内一般离线运行，找不到权重直接报错而不会去 HuggingFace 下载
+  allow_download: false
+
+logging:
+  dir: /var/log/clearvoice
+  level: INFO
+  console: true
+  max_bytes: 52428800
+  backup_count: 10
+  encoding: utf-8
+  fmt: "%(asctime)s | %(levelname)-8s | rid=%(request_id)s | %(name)-26s | %(message)s"
+  datefmt: "%Y-%m-%d %H:%M:%S"
+  access_log: true
+  uvicorn_level: INFO
+  # 把第三方库/uvicorn 打到 stdout、stderr 的内容也收进日志文件
+  capture_stdio: true
