@@ -4,6 +4,9 @@
 支持并发与 GPU/CPU 资源准入控制、自动判断音频是否需要降噪、mp3/wav/m4a 原格式返回、参数可配置化、日志按大小滚动落盘。
 
 > 本目录为新增内容，**不修改原工程的任何文件**。
+>
+> 想用 **CUDA 12.4** 基础镜像（本地已有 `nvidia/cuda:12.4.1-runtime-ubuntu22.04`）、
+> 走 **Windows 构建 → Linux 部署**的场景，请直接看 `deployment/DEPLOY_WINDOWS_LINUX.md`。
 
 ---
 
@@ -14,6 +17,7 @@ deployment/
 ├── Dockerfile              # 唯一的 Dockerfile，产出最终运行镜像
 ├── entrypoint.sh           # 容器启动脚本
 ├── requirements.txt
+├── DEPLOY_WINDOWS_LINUX.md # Windows 构建 → Linux 部署（CUDA 12.4）专项指南
 ├── tools/                  # build(联网) / export(联网) / load(内网)
 ├── config/
 │   └── config.yaml         # 默认配置（运行时挂载覆盖，改参无需重建镜像）
@@ -75,7 +79,9 @@ cd ClearerVoice-Studio
 | `--tag` / `-Tag` | 指定镜像名，默认 `clearvoice-denoise:1.0.0` |
 | `--pip-mirror` / `-PipMirror` | pip 镜像源，如 `https://pypi.tuna.tsinghua.edu.cn/simple` |
 | `--apt-mirror` / `-AptMirror` | apt 镜像主机名，如 `mirrors.aliyun.com` |
-| `--cuda-image` / `-CudaImage` | 换基础镜像（老驱动可改 `nvidia/cuda:11.3.1-cudnn8-runtime-ubuntu20.04`，并同步 `--torch-index .../cu113`） |
+| `--cuda-image` / `-CudaImage` | 换基础镜像。**torch 变体默认按基础镜像自动推导**（如 `nvidia/cuda:12.4.1-runtime-ubuntu22.04` → cu124） |
+| `--torch-cuda` / `-TorchCuda` | 显式指定 torch 的 CUDA 变体（如 `cu124`），留空则按基础镜像自动推导 |
+| `--torch-index` / `-TorchIndexUrl` | 显式指定 torch 下载源，留空则按 torch 变体自动推导（如 `https://download.pytorch.org/whl/cu124`） |
 
 ### 步骤 2（联网机器）：导出成 tar
 

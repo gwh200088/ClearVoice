@@ -64,7 +64,10 @@ RUN set -eux; \
 COPY deployment/requirements.txt /tmp/requirements.txt
 
 # requests 仅用于容器内跑 smoke_test 自测，运行时不依赖
+# 注意：全局 ENV 里有 PIP_NO_INDEX=1（运行期禁网兜底），构建期装依赖必须先 unset，
+#       否则 pip 会处于 --no-index 模式，报 "from versions: none" 装不到任何包。
 RUN set -eux; \
+    unset PIP_NO_INDEX; \
     PIP_IDX=""; \
     if [ -n "${PIP_INDEX_URL}" ]; then PIP_IDX="-i ${PIP_INDEX_URL}"; fi; \
     python -m pip install --upgrade ${PIP_IDX} pip setuptools wheel; \
