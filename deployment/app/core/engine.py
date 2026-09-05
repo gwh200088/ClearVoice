@@ -239,6 +239,11 @@ class DenoiseEngine:
         return slot
 
     def _acquire_slot(self, model_name: str, timeout_s: float) -> ModelSlot:
+        """获取一个模型实例。
+
+        约定（重要）：返回时该实例的锁**已被当前线程持有**，调用方负责在 finally 中
+        `slot.lock.release()`，且中途不得再次加锁（threading.Lock 不可重入）。
+        """
         pool = self.get_pool(model_name)
         deadline = time.monotonic() + max(1.0, timeout_s)
         while True:
@@ -353,10 +358,11 @@ class DenoiseEngine:
 
         slot = None
         try:
+            # 注意：_acquire_slot 返回时该实例已被当前线程独占，
+            # 这里绝不能再对 slot.lock 加锁 —— threading.Lock 不可重入，会立刻死锁。
             slot = self._acquire_slot(model_name, timeout_s)
             t0 = time.monotonic()
-            with slot.lock:
-                wav = slot.cv(input_path=in_path, online_write=False)
+            wav = slot.cv(input_path=in_path, online_write=False)
             infer_seconds = time.monotonic() - t0
             slot.used_count += 1
             slot.last_used_ts = time.time()
