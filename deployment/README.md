@@ -251,6 +251,8 @@ docker run -d --name clearvoice \
 
 ## 5. 接口
 
+> 想给**另一个项目对接调用**（入参出参、curl/代码示例、错误码）：请直接看 `deployment/API_REFERENCE.md`。
+
 | 方法 | 路径 | 说明 |
 |---|---|---|
 | POST | `/api/v1/denoise` | 同步降噪（multipart 上传），默认直接返回音频字节 |
