@@ -121,13 +121,15 @@ class ConcurrencyConfig:
 
 @dataclass
 class DenoiseConfig:
+    # 以下默认值按"执法记录仪"场景标定（长录音 / 人声稀疏 / 环境噪声复杂 / 突发噪声多），
+    # 通用场景请参考 README §8.4 重新调整
     auto_detect: bool = True
-    snr_threshold_db: float = 25.0
-    noise_percentile: float = 10.0
-    speech_percentile: float = 90.0
+    snr_threshold_db: float = 22.0
+    noise_percentile: float = 8.0
+    speech_percentile: float = 85.0
     frame_ms: float = 20.0
-    analyze_max_seconds: float = 45.0
-    min_speech_ratio: float = 0.01
+    analyze_max_seconds: float = 180.0
+    min_speech_ratio: float = 0.005
     min_duration_s: float = 0.2
     bitrate: str = ""
     sample_rate: int = 0

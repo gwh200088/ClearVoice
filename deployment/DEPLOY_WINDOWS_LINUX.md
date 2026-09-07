@@ -205,6 +205,13 @@ docker run -d --name clearvoice \
 > 多卡机器用 `--gpus '"device=N"'` 或 `NVIDIA_VISIBLE_DEVICES=N` 限定卡号，
 > 别用 `CUDA_VISIBLE_DEVICES`（会造成 nvidia-smi 与 CUDA 下标错位）。
 > CPU 跑法：去掉 GPU 相关参数，追加 `-e CV_DEVICE=cpu`。
+>
+> **启动参数与 config.yaml 每一项的含义、默认值、何时调整，见 `README.md` §8 配置**
+> （含环境变量 `CV_*` 速查表与按场景调参速查）。挂载的 config.yaml 记得从最新的
+> `deployment/config/config.yaml` 复制：旧版缺 `runtime.fp16` / `runtime.batch_chunks`
+> 字段时这两个加速开关不会生效；且 denoise 检测参数（`snr_threshold_db` / `noise_percentile` /
+> `speech_percentile` / `analyze_max_seconds` / `min_speech_ratio`）默认值已按**执法记录仪场景**
+> 调整，宿主机 config 里若仍是旧值会**覆盖**这些新默认，需同步修改。
 
 ### 4.4 部署验证
 

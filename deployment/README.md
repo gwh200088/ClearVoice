@@ -403,12 +403,15 @@ CPU 模式同理：以 `psutil.virtual_memory().available - reserve_mb` 为可�
 流程：ffmpeg 解码为 16k 单声道 → 20ms 分帧算功率 → 取功率最低的 `noise_percentile`% 帧估计噪声底 →
 取功率最高的 `speech_percentile`% 帧估计语音电平 → `SNR = 10·log10(语音/噪声)`。
 
-* `SNR < denoise.snr_threshold_db`（默认 25dB）→ 需要降噪；
+* `SNR < denoise.snr_threshold_db`（当前默认 22dB，按执法记录仪场景标定）→ 需要降噪；
 * 语音帧占比 < `min_speech_ratio`（近乎静音）或时长 < `min_duration_s` → 直接跳过；
 * 判定无需降噪时**字节级原样拷贝**原文件返回，格式/码率/元数据完全不变，也不占用 GPU。
 
 相关参数：`denoise.auto_detect`、`snr_threshold_db`、`noise_percentile`、`speech_percentile`、`frame_ms`、
 `analyze_max_seconds`（超长音频只取头/中/尾各 1/3 分析）。
+每个参数**调大 / 调小分别会带来什么影响**，见 §8.4；执法记录仪场景的取值理由见 §8.6。
+
+> 注意是**整段判定**：只要整段语音占比达标，就整段过模型，不会只处理有人声的片段。
 
 ### 16kHz 单声道 WAV 实测参考
 
@@ -454,48 +457,262 @@ mini-batch 一次前向（窗口间逐样本归一化、互不干扰，结果与
 
 ## 8. 配置
 
-优先级：**内置默认值 < `config.yaml` < 环境变量 `CV_*`**。
+### 8.1 配置优先级与三种修改方式
 
-* 嵌套写法：`CV_SECTION__KEY`，例如 `CV_CONCURRENCY__MAX_CONCURRENCY=4`、`CV_LOGGING__MAX_BYTES=10485760`
-* 常用扁平别名：`CV_DEVICE`、`CV_GPU_IDS`、`CV_MODEL`、`CV_MODEL_POOL_SIZE`、`CV_MAX_CONCURRENCY`、
-  `CV_MAX_QUEUE_SIZE`、`CV_MODEL_ROOT`、`CV_API_KEY`、`CV_PORT`、`CV_TEMP_DIR`、`CV_AUTO_DETECT`、
-  `CV_SNR_THRESHOLD_DB`、`CV_LOG_DIR`、`CV_LOG_LEVEL`、`CV_LOG_MAX_BYTES`、`CV_LOG_BACKUP_COUNT`、`CV_DECODE_WINDOW_S`、
-  `CV_FP16`、`CV_BATCH_CHUNKS`
+优先级：**内置默认值 < `config.yaml` < 环境变量 `CV_*`**。环境变量永远最高，适合做"最后一层覆盖"。
 
-### 主要配置项
+| 方式 | 怎么做 | 适用 |
+|---|---|---|
+| 环境变量 | 启动时 `-e CV_XXX=yyy` | 改少量参数，不想动配置文件 |
+| 挂载配置目录（推荐） | `-v /data/clearvoice/config:/app/config:ro`，改完 `docker restart clearvoice` | 大量参数调整，配置持久化在宿主机 |
+| 改镜像内文件 | 重新构建镜像 | 不推荐 |
+
+注意：
+* 嵌套写法支持任意深度：`CV_段__键`（双下划线），如 `CV_RESOURCE__GPU__PER_TASK_MB=2048`
+* `CV_CONFIG_FILE=/任意路径/config.yaml` 可指定别的配置文件
+* **挂载 config 目录是整体覆盖**：目录里必须放一份完整的 `config.yaml`（从 `deployment/config/config.yaml` 复制后按需改），漏掉的字段会退回内置默认值而不是镜像里的值
+* 运行中改配置**不会热生效**，必须 `docker restart`
+
+### 8.2 启动参数（docker run）
+
+生产推荐模板：
+
+```bash
+docker run -d \
+  --name clearvoice \
+  --restart unless-stopped \
+  --gpus '"device=0"' \
+  -p 8000:8000 \
+  -v /data/models/ClearerVoice-Studio:/opt/models/ClearerVoice-Studio:ro \
+  -v /data/clearvoice/config:/app/config:ro \
+  -v /data/clearvoice/logs:/var/log/clearvoice \
+  -e CV_API_KEY=change-me \
+  clearvoice-denoise:1.2.0-cu124
+```
+
+| docker 参数 | 必填 | 说明 |
+|---|---|---|
+| `--gpus '"device=N"'` | GPU 部署必填 | 限定第 N 张卡。Docker 18.09 用 `--runtime=nvidia`。多卡机器优先用它或 `NVIDIA_VISIBLE_DEVICES=N`；**不要用 `CUDA_VISIBLE_DEVICES`**（会造成 nvidia-smi 与 CUDA 下标错位，确需时配合 `runtime.gpu_ids`） |
+| `-p 宿主端口:8000` | 是 | 服务固定监听容器内 8000 |
+| `-v 模型包:/opt/models/ClearerVoice-Studio:ro` | 是 | 模型根目录，内含 `<模型名>/last_best_checkpoint`。挂的是父目录时要设 `CV_MODEL_ROOT` |
+| `-v 配置目录:/app/config:ro` | 可选 | 覆盖配置，注意 8.1 的"整体覆盖"说明 |
+| `-v 日志目录:/var/log/clearvoice` | 可选 | 日志持久化到宿主机 |
+| `-v 临时目录:/tmp/clearvoice` | 可选 | 中间文件目录（长音频文件较大） |
+| `--restart unless-stopped` | 建议 | 宕机 / 宿主机重启后自动拉起 |
+| `-e CV_*` | 可选 | 配置覆盖，见 8.3 / 8.4 |
+
+CPU 模式：去掉 GPU 相关参数，追加 `-e CV_DEVICE=cpu` 即可。
+
+### 8.3 常用环境变量速查（别名表）
+
+| 环境变量 | 对应配置 | 环境变量 | 对应配置 |
+|---|---|---|---|
+| `CV_HOST` | server.host | `CV_DEVICE` | runtime.device |
+| `CV_PORT` | server.port | `CV_GPU_IDS` | runtime.gpu_ids |
+| `CV_API_KEY` | server.api_key | `CV_MODEL` | runtime.model |
+| `CV_MAX_UPLOAD_MB` | server.max_upload_mb | `CV_MODEL_POOL_SIZE` | runtime.model_pool_size |
+| `CV_SYNC_TIMEOUT_S` | server.sync_timeout_s | `CV_AUTO_SELECT_MODEL` | runtime.auto_select_model |
+| `CV_TASK_TTL_S` | server.task_ttl_s | `CV_TORCH_THREADS` | runtime.torch_threads |
+| `CV_MAX_CONCURRENCY` | concurrency.max_concurrency | `CV_PRELOAD` | runtime.preload |
+| `CV_MAX_QUEUE_SIZE` | concurrency.max_queue_size | `CV_DECODE_WINDOW_S` | runtime.decode_window_s |
+| `CV_QUEUE_TIMEOUT_S` | concurrency.queue_timeout_s | `CV_ONE_TIME_DECODE_LENGTH_S` | runtime.one_time_decode_length_s |
+| `CV_MODEL_ROOT` | models.root | `CV_PROCESS_MEMORY_RATIO` | runtime.process_memory_ratio |
+| `CV_ALLOW_DOWNLOAD` | models.allow_download | `CV_FP16` | runtime.fp16 |
+| `CV_TEMP_DIR` | audio.temp_dir | `CV_BATCH_CHUNKS` | runtime.batch_chunks |
+| `CV_AUTO_DETECT` | denoise.auto_detect | `CV_LOG_DIR` | logging.dir |
+| `CV_SNR_THRESHOLD_DB` | denoise.snr_threshold_db | `CV_LOG_LEVEL` | logging.level |
+| `CV_LOG_MAX_BYTES` | logging.max_bytes | `CV_LOG_CONSOLE` | logging.console |
+| `CV_LOG_BACKUP_COUNT` | logging.backup_count | `CV_CONFIG_FILE` | 配置文件路径（保留字） |
+
+其余配置项用嵌套写法：`CV_SERVER__ROOT_PATH=/denoise`、`CV_RESOURCE__GPU__PER_TASK_MB=2048`、`CV_DENOISE__ANALYZE_MAX_SECONDS=60` 等。
+
+### 8.4 全量配置项说明
+
+#### server（HTTP 服务）
+
+| 配置 | 默认 | 说明 / 何时调整 |
+|---|---|---|
+| `server.host` | `0.0.0.0` | 监听地址，容器内固定即可 |
+| `server.port` | `8000` | 容器内端口，对外端口由 `-p` 决定 |
+| `server.root_path` | 空 | 挂反向代理子路径时填，如 `/denoise` |
+| `server.api_key` | 空 | 设置后请求需带 `X-API-Key`（`/health`、`/docs` 等除外） |
+| `server.max_upload_mb` | `300` | 单文件 / 批量总上传上限（MB）；批量统计 SNR 时可临时调大 |
+| `server.sync_timeout_s` | `900` | 同步接口最长等待（秒）；推理时间超过 15 分钟的长音频需调大 |
+| `server.task_ttl_s` | `1800` | 异步任务结果保留时长（秒） |
+| `server.max_tasks` | `2000` | 任务记录条数上限 |
+
+#### runtime（模型与推理）
+
+| 配置 | 默认 | 说明 / 何时调整 |
+|---|---|---|
+| `runtime.device` | `auto` | `auto` / `cpu` / `cuda` / `cuda:N` |
+| `runtime.gpu_ids` | 空 | 限制本进程可见 GPU（等价 CUDA_VISIBLE_DEVICES），留空用全部 |
+| `runtime.model` | `MossFormerGAN_SE_16K` | 降噪模型：`FRCRN_SE_16K` / `MossFormerGAN_SE_16K` / `MossFormer2_SE_48K` |
+| `runtime.auto_select_model` | true | 输入采样率 ≥32kHz 自动切 48k 模型，输出重采样回原采样率 |
+| `runtime.model_pool_size` | `2` | 模型实例数 = 真实并行度；自动提升到 ≥ `max_concurrency`（每实例约占 2~3GB 显存） |
+| `runtime.torch_threads` | `4` | CPU 推理线程数（GPU 模式影响小） |
+| `runtime.allow_tf32` | true | 允许 TF32（仅 Ampere 及以上有效，T4 无此单元、无影响） |
+| `runtime.preload` | true | 启动即加载模型并预热；`false` 延迟到首次请求（启动快但首请求慢） |
+| `runtime.decode_window_s` | `0` | 分段窗口秒数；`0` 用模型默认（16k 模型 10s）。**调小可降显存峰值但不会更快** |
+| `runtime.one_time_decode_length_s` | `0` | 音频超过该时长才分段；`0` 用模型默认。与 `decode_window_s` 保持同步改，不要只改一个 |
+| `runtime.process_memory_ratio` | `0` | `>0` 时设显存硬上限比例（如 `0.8`）兜底防 OOM；`0` 不限制 |
+| `runtime.fp16` | true | **仅 MossFormerGAN 生效**：权重+输入切 FP16，T4 提速约 1.5~2 倍。音质异常时改 false |
+| `runtime.batch_chunks` | `8` | **仅 MossFormerGAN 生效**：分段解码一次 forward 合并的窗口数，0=关闭；越大越快越吃显存，OOM 自动退回 1 |
+
+#### concurrency（并发）
+
+| 配置 | 默认 | 说明 / 何时调整 |
+|---|---|---|
+| `concurrency.max_concurrency` | `2` | 同时推理任务数；受显存约束，T4 16G 建议 ≤2 |
+| `concurrency.max_queue_size` | `64` | 排队上限，超出返回 429 |
+| `concurrency.queue_timeout_s` | `600` | 排队等待超时（秒） |
+
+#### resource（资源准入）
+
+| 配置 | 默认 | 说明 / 何时调整 |
+|---|---|---|
+| `resource.poll_interval_ms` | `200` | 资源轮询间隔 |
+| `resource.gpu.enabled` | true | 是否启用显存准入（false 则不限制） |
+| `resource.gpu.reserve_mb` | `512` | 常驻预留显存；与其它进程共享 GPU 时调大 |
+| `resource.gpu.per_task_mb` | `1024` | 单任务显存估算基准；实际按 `per_task_mb × (1 + min(1, 音频分钟数/60 × 0.25))` 估算 |
+| `resource.gpu.max_usage_ratio` | `0.90` | 本进程可用显存占比上限；共享 GPU 时调小 |
+| `resource.gpu.count_cached_as_free` | true | 把 PyTorch 缓存池空闲显存计为可用（区分显示/真实占用）。显存紧张改 false 转保守口径 |
+| `resource.gpu.empty_cache_when_idle` | true | 空闲时自动 `empty_cache()` 释放缓存 |
+| `resource.gpu.empty_cache_min_interval_s` | `10` | 释放缓存的最小间隔 |
+| `resource.cpu.enabled` | true | CPU 模式的内存准入 |
+| `resource.cpu.reserve_mb` | `1024` | 内存预留 |
+| `resource.cpu.per_task_mb` | `1024` | 单任务内存估算 |
+| `resource.cpu.max_usage_ratio` | `0.85` | 可用内存占比上限 |
+
+#### denoise（降噪策略）
+
+> 当前默认值按 **执法记录仪场景**（长录音 + 人声稀疏 + 环境噪声复杂）标定。
+> 通用场景请按下面的"调大 / 调小影响"重新调整，详见 §8.6。
+
+| 配置 | 默认 | 一句话作用 |
+|---|---|---|
+| `denoise.auto_detect` | true | 自动噪声检测；`false` = 所有音频无条件降噪 |
+| `denoise.snr_threshold_db` | `22.0` | 估算 SNR 低于该值才降噪，否则原样返回 |
+| `denoise.noise_percentile` | `8.0` | 取功率最低 N% 的帧估噪声底 |
+| `denoise.speech_percentile` | `85.0` | 取功率最高的 (100-N)% 帧估语音电平 |
+| `denoise.frame_ms` | `20.0` | 检测分帧长度（毫秒） |
+| `denoise.analyze_max_seconds` | `180.0` | 检测最多分析的秒数（头/中/尾各 1/3）；`0` = 分析整段 |
+| `denoise.min_speech_ratio` | `0.005` | 语音帧占比低于该值判"没人说话"，整段跳过 |
+| `denoise.min_duration_s` | `0.2` | 短于该时长直接跳过 |
+| `denoise.bitrate` | 空 | 输出码率（如 `128k`）；空 = 跟随输入 |
+| `denoise.sample_rate` | `0` | 输出采样率；`0` = 跟随输入 |
+| `denoise.channels` | `0` | 输出声道数；`0` = 跟随输入，`1`/`2` 强制单/双声道 |
+
+**各参数调大 / 调小的影响**
+
+判定链路先记住两条：
+
+* 噪声底 ↑ 或 语音电平 ↓ → SNR ↓ → **更容易判"需要降噪"**（保守，不易漏处理，但更慢）
+* 噪声底 ↓ 或 语音电平 ↑ → SNR ↑ → **更容易判"不需要降噪"**（省算力，但可能漏处理）
+
+| 参数 | 调大会怎样 | 调小会怎样 |
+|---|---|---|
+| `snr_threshold_db` | 更多音频进模型 → **更彻底、更慢** | 只有很脏的才处理 → **更快，中等噪声会漏处理** |
+| `noise_percentile` | 低功率帧取更多 → 混入中等功率帧 → 噪声底↑ → SNR↓ → **更倾向降噪** | 只取最安静的帧 → 噪声底更纯↓ → SNR↑ → **更倾向跳过**（<3 时样本帧太少会抖动） |
+| `speech_percentile` | 只取极少数峰值帧 → **易被警笛/关门/喊叫顶高** → 语音电平↑ → SNR↑ → **脏音频可能被误判成干净** | 取更多高能帧做平均 → 削弱突发噪声 → 语音电平↓ → SNR↓ → **更倾向降噪** |
+| `frame_ms` | 时域分辨率降、短促语音被平滑 → 语音与噪声差异变小 → SNR↓ → **更倾向降噪** | 更精细、能捕捉短促人声，但对瞬态噪声更敏感 |
+| `analyze_max_seconds` | 样本更全面 → **判定更准**；检测耗时增加（仍只是 CPU 解码） | 样本少 → 长音频易抽样偏差；设 `0` 分析整段最准 |
+| `min_speech_ratio` | 更多纯噪声段被跳过（省算力），但**可能跳过有价值的短对话** | 更保守，几乎不跳过 |
+| `min_duration_s` | 更多极短音频被跳过 | 更短的音频也会处理 |
+
+#### audio（编解码）
 
 | 配置 | 默认 | 说明 |
 |---|---|---|
-| `server.host` / `server.port` | `0.0.0.0` / `8000` | 监听地址与端口 |
-| `server.api_key` | 空 | 设置后需携带 `X-API-Key`（`/health`、`/docs` 等除外） |
-| `server.max_upload_mb` | 300 | 单文件上限 |
-| `server.sync_timeout_s` | 900 | 同步接口最长等待 |
-| `server.task_ttl_s` | 1800 | 异步任务结果保留时长 |
-| `runtime.device` | `auto` | `auto` / `cpu` / `cuda` / `cuda:N` |
-| `runtime.model` | `MossFormerGAN_SE_16K` | 降噪模型，可选 `FRCRN_SE_16K`、`MossFormer2_SE_48K` |
-| `runtime.auto_select_model` | true | 输入采样率 >= 32kHz 时自动切到 48k 模型 |
-| `runtime.model_pool_size` | 2 | 模型实例数（决定真实并行度） |
-| `runtime.decode_window_s` | 0（用模型默认） | 单段解码长度，调小可降低显存峰值 |
-| `runtime.fp16` | true | MossFormerGAN_SE_16K 前向切 FP16(autocast)，吃满 T4/L4 TensorCore（提速主开关） |
-| `runtime.batch_chunks` | 8 | 长音频分段解码时一次 forward 合并的窗口数，0=关闭；越大越吃显存，OOM 会自动退回 1 |
-| `concurrency.max_concurrency` | 2 | 同时推理任务数 |
-| `concurrency.max_queue_size` | 64 | 排队任务上限 |
-| `resource.gpu.reserve_mb` | 512 | 常驻预留显存 |
-| `resource.gpu.per_task_mb` | 1024 | 单任务显存估算基准 |
-| `resource.gpu.max_usage_ratio` | 0.90 | 本进程可用显存占总显存比例上限 |
-| `resource.gpu.count_cached_as_free` | true | 是否把缓存池空闲计入可用 |
-| `resource.cpu.*` | 见配置文件 | CPU 模式的内存准入参数 |
-| `denoise.auto_detect` / `snr_threshold_db` | true / 25.0 | 自动检测与判定阈值 |
-| `denoise.bitrate` / `sample_rate` / `channels` | 空 / 0 / 0 | 输出控制，留空表示跟随输入 |
-| `audio.allowed_formats` | `[mp3, wav, m4a]` | 允许的输入格式 |
-| `models.root` | `/opt/models/ClearerVoice-Studio` | 模型权重根目录 |
-| `models.allow_download` | false | 权重缺失时是否允许联网下载。**内网部署必须保持 false** |
-| `logging.dir` | `/var/log/clearvoice` | 日志目录 |
+| `audio.allowed_formats` | `[mp3, wav, m4a]` | 允许的输入/输出格式 |
+| `audio.temp_dir` | `/tmp/clearvoice` | 中间文件目录（可挂卷持久化） |
+| `audio.probe_timeout_s` | `20` | ffprobe 探测超时 |
+| `audio.encode_timeout_s` | `300` | 编码超时 |
+| `audio.decode_timeout_s` | `120` | 解码超时 |
+
+#### models（模型权重）
+
+| 配置 | 默认 | 说明 |
+|---|---|---|
+| `models.root` | `/opt/models/ClearerVoice-Studio` | 模型根目录，与 `-v` 挂载点对应 |
+| `models.allow_download` | false | 权重缺失时是否联网下载。**内网部署必须保持 false** |
+
+#### logging（日志）
+
+| 配置 | 默认 | 说明 |
+|---|---|---|
+| `logging.dir` | `/var/log/clearvoice` | 落盘目录 |
 | `logging.level` | `INFO` | 日志级别 |
-| `logging.max_bytes` | 52428800 (50MB) | **单个日志文件大小上限**，超过即滚动 |
-| `logging.backup_count` | 10 | 保留的历史日志文件数 |
-| `logging.console` | true | 是否同时输出到容器 stdout |
-| `logging.capture_stdio` | true | 是否把第三方库/uvicorn 的 stdout、stderr 也收进日志 |
+| `logging.console` | true | 同时输出到容器 stdout |
+| `logging.max_bytes` | 52428800 (50MB) | 单文件上限，超过滚动 |
+| `logging.backup_count` | `10` | 保留历史文件数 |
+| `logging.access_log` | true | 记录 HTTP 访问日志 |
+| `logging.capture_stdio` | true | 把第三方库 / uvicorn 的 stdout、stderr 收进日志文件 |
+| `logging.uvicorn_level` | `INFO` | uvicorn 自身日志级别 |
+| `logging.encoding` / `logging.fmt` / `logging.datefmt` | 见配置文件 | 日志编码与格式串，一般不用动 |
+
+### 8.5 按场景调参速查
+
+| 场景 | 参数组合 |
+|---|---|
+| T4 16GB 单卡生产 | 默认即可（fp16 / batch_chunks 已默认开启，max_concurrency=2） |
+| 显存吃紧 / 偶发 OOM | 先 `CV_BATCH_CHUNKS=4`（或 2），仍 OOM 再 `CV_DECODE_WINDOW_S=4`（同时设 `CV_ONE_TIME_DECODE_LENGTH_S=4`） |
+| 干净素材被误降噪 | 先抽代表性样本跑一批降噪请求，从日志收集 `snr_db` 分布，再 `CV_SNR_THRESHOLD_DB=<干净簇下限-2>` |
+| 想让所有音频一律降噪 | `CV_AUTO_DETECT=false`（不再检测，全部过模型，更慢但行为可预期） |
+| 900s 超长音频同步接口超时 | `CV_SYNC_TIMEOUT_S=1800`，或改用异步任务接口 |
+| 与其它进程共享一张 GPU | `CV_RESOURCE__GPU__MAX_USAGE_RATIO=0.6` + `CV_RESOURCE__GPU__RESERVE_MB=2048` |
+| FP16 音质有差异 | `CV_FP16=false`（batch 合并仍生效，仍有约 2 倍提速） |
+| 执法记录仪等长录音 | 见 §8.6，默认参数已按该场景标定 |
+
+### 8.6 执法记录仪场景（长录音 + 人声稀疏）
+
+**场景特征**：录音 30 分钟~数小时；人声只在对话时出现（可能只占 10~30%，甚至更低）；
+持续的环境噪声（街道 / 风声 / 车载底噪）；突发高能量噪声（警笛、关门、喊叫、碰撞）。
+
+**通用默认值在该场景会出的问题**：
+
+| 通用默认 | 后果 |
+|---|---|
+| `analyze_max_seconds=45` | 只从 1~2 小时的录音里抽头/中/尾共 45 秒。人声稀疏时**很可能整段抽不到人声** → `speech_ratio` 极低 → 判 `no_speech` → **整段跳过，关键对话丢失**（最严重） |
+| `speech_percentile=90` | 只取最高 10% 的峰值帧。警笛/关门等突发噪声会把"语音电平"顶高 → SNR 虚高 → **脏音频被误判成干净而跳过** |
+| `min_speech_ratio=0.01` | 1 小时录音里只有 30 秒对话（占比 0.83%）就低于 1% → **整段跳过** |
+| `snr_threshold_db=25` | 户外本底噪声高、SNR 天然低于安静室内，设 25 会让几乎所有音频都过模型（慢）；但也别调太低，否则中等噪声不处理 |
+
+**本场景推荐值**（已写入 `config.yaml` 与内置默认值）：
+
+| 参数 | 通用默认 | 执法场景 | 理由 |
+|---|---|---|---|
+| `analyze_max_seconds` | 45 | **180** | 头/中/尾各 60 秒，大幅降低抽样偏差；要求绝对准确可设 `0` |
+| `speech_percentile` | 90 | **85** | 多取高能帧平均，削弱突发噪声干扰 |
+| `min_speech_ratio` | 0.01 | **0.005** | 避免"只有一两句话"的录音被整段跳过 |
+| `noise_percentile` | 10 | **8** | 静音段充裕时拿到更纯的噪声底 |
+| `snr_threshold_db` | 25 | **22** | 户外 SNR 天然偏低，兼顾覆盖率与算力 |
+
+**三条实践建议**：
+
+1. **用一批代表性样本跑降噪请求，从服务日志统计 SNR 分布**再定 `snr_threshold_db`，
+   取"该处理"与"不该处理"两簇之间，比任何经验值都准。
+   每次降噪请求日志都会打印检测结果（格式见 §9），可以这样汇总一批样本的 `snr_db`：
+
+   ```bash
+   # 每行日志形如: ... 噪声检测: {'need_denoise': True, ..., 'snr_db': 11.85, ...}
+   grep -o "snr_db': [-0-9.e]*" /var/log/clearvoice/clearvoice.log \
+     | awk -F"': " '{print $2}' | sort -n > /tmp/snrs.txt
+   wc -l < /tmp/snrs.txt                        # 样本数
+   sed -n '1p;$p' /tmp/snrs.txt                 # min / max
+   awk '{a[NR]=$1} END{print "p10="a[int(NR*0.1)+1]" p50="a[int(NR/2)+1]" p90="a[int(NR*0.9)+1]}' /tmp/snrs.txt
+   ```
+
+   注意：日志是滚动文件，样本足够后建议先从当前批次拷走再清空，避免混入旧数据；也可以改看
+   `X-Noise-Snr-Db` 响应头（每条降噪响应都带）。
+
+2. **关键录音不放心就关掉自动检测**：`CV_AUTO_DETECT=false`，全部过模型，
+   行为完全可预期（代价是所有音频都走模型，慢）。
+3. **重要限制**：当前是**整段判定、整段处理** —— 只要整段 `speech_ratio` 达标就整段过模型，
+   **不会只处理有人声的片段**。所以"大段无人声"并不会自动省算力，
+   只有整段语音占比极低（`no_speech`）或整段 SNR 达标时才会整段跳过。
+   若想真正只降噪有人声的部分以省时间，需要调用方先用 VAD 把长音频切段再逐段调用接口，
+   服务目前不内置该能力。
 
 ---
 
