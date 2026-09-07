@@ -280,14 +280,18 @@ class DenoiseEngine:
             time.sleep(0.02)
 
     def warmup(self) -> None:
-        """用极短静音音频跑一次推理，提前完成 CUDA 上下文 / cuDNN 初始化"""
+        """用极短的低幅正弦跑一次推理，提前完成 CUDA 上下文 / cuDNN / FP16 kernel 初始化"""
         import soundfile as sf
 
         tmp_wav = os.path.join(self.cfg.audio.temp_dir, "_warmup.wav")
         try:
             os.makedirs(self.cfg.audio.temp_dir, exist_ok=True)
             sr = 16000
-            sf.write(tmp_wav, np.zeros(int(sr * 0.5), dtype=np.float32), sr, subtype="PCM_16")
+            # 不能用全零静音：原工程 norm_factor = sqrt(t / sum(x**2)) 在全零时得到 inf，
+            # 输出全是 NaN，既无法真正预热 kernel，也会误触发 FP16 降级检查
+            idx = np.arange(int(sr * 0.5), dtype=np.float32) / float(sr)
+            warm = (0.01 * np.sin(2 * np.pi * 440.0 * idx)).astype(np.float32)
+            sf.write(tmp_wav, warm, sr, subtype="PCM_16")
             for name in list(self._pools.keys()):
                 slot = self._acquire_slot(name, 60.0)
                 try:
