@@ -245,6 +245,8 @@ class DenoiseEngine:
             cv=cv,
             model=model,
         )
+        # 打印实际生效值：非 MossFormerGAN 模型上这两个开关会被置为关闭，
+        # 直接打配置值会让人误以为加速已生效
         self.logger.info(
             "模型实例就绪 name=%s index=%d device=%s sampling_rate=%d decode_window=%s "
             "fp16=%s batch_chunks=%d 耗时=%.2fs",
@@ -253,8 +255,8 @@ class DenoiseEngine:
             getattr(model, "device", "?"),
             sampling_rate,
             getattr(model.args, "decode_window", "?"),
-            use_fp16,
-            batch_chunks,
+            getattr(model.args, "fp16", False),
+            getattr(model.args, "batch_chunks", 0),
             time.monotonic() - started,
         )
         return slot
