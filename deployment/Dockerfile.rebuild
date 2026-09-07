@@ -1,0 +1,95 @@
+# -----------------------------------------------------------------------------
+# 增量重建镜像：基于【已经构建好的运行镜像】只替换全部代码
+#
+# 与 deployment/Dockerfile 的区别：
+#   * 不重装 Python / ffmpeg / torch / 任何依赖（全部复用 base 镜像），
+#     所以构建只要几十秒，且完全不需要联网。
+#   * 只覆盖代码目录：clearvoice 推理包 + 服务代码 + 配置 + 启动脚本。
+#   * 构建期做自检（语法编译 + 关键 import + 加速开关是否已打进代码），
+#     代码有问题会直接构建失败，不会给你一个"跑起来才发现问题"的镜像。
+#
+# 适用：只改了代码（本次的 mini-batch 推理 / FP16 加速改动就是这类）。
+# 若改了 deployment/requirements.txt，需要把 INSTALL_DEPS 设为 1（需联网）。
+#
+# 用法（在仓库根目录执行，注意结尾的 . 表示构建上下文是仓库根）：
+#   docker build -f deployment/Dockerfile.rebuild \
+#     --build-arg BASE_IMAGE=<本地已存在的镜像名> \
+#     -t clearvoice-denoise:1.1.0 .
+#
+# 必须先 docker images 确认镜像名再填 BASE_IMAGE。
+# 注意：BASE_IMAGE 必须是本地已存在的镜像。若本地没有，Docker 不会报"找不到镜像"，
+#       而是把它当成远端镜像去 docker.io 拉取，表现为：
+#         failed to fetch oauth token / dial tcp ... connectex
+#       看到这类网络报错，先怀疑镜像名写错或镜像不在当前这台机器上。
+# -----------------------------------------------------------------------------
+ARG BASE_IMAGE=clearvoice-denoise:1.0.0
+FROM ${BASE_IMAGE}
+
+# 注意：在 FROM 之前声明的 ARG 不会自动带进构建阶段，必须重新声明一次，
+#      否则下面 LABEL 里的 ${BASE_IMAGE} 展开为空（构建时报 UndefinedVar 警告）
+ARG BASE_IMAGE
+
+# 代码若新增了第三方依赖，设为 1 才会重装 requirements.txt（需要联网）
+ARG INSTALL_DEPS=0
+ARG PIP_INDEX_URL=""
+# 便于溯源：建议传入本次构建对应的 git commit
+ARG GIT_COMMIT=unknown
+ARG BUILD_TAG=rebuild
+
+LABEL clearvoice.build="${BUILD_TAG}" \
+      clearvoice.git_commit="${GIT_COMMIT}" \
+      clearvoice.base_image="${BASE_IMAGE}"
+
+WORKDIR /app
+
+# ---------------------------------------------------------------- 全部代码
+# ClearerVoice-Studio 推理包（本次改动的 decode.py 在这里）
+COPY clearvoice/clearvoice /opt/clearvoice/clearvoice
+# 服务代码与默认配置
+COPY deployment/app /app/app
+COPY deployment/config /app/config
+COPY deployment/entrypoint.sh /app/entrypoint.sh
+COPY deployment/requirements.txt /app/requirements.txt
+
+# 兜底：脚本在拷贝过程中若被转成 CRLF 会执行失败，这里统一转成 LF
+RUN set -eux; \
+    sed -i 's/\r$//' /app/entrypoint.sh; \
+    chmod +x /app/entrypoint.sh; \
+    mkdir -p /var/log/clearvoice /tmp/clearvoice /opt/models
+
+# ---------------------------------------------------------------- 可选：重装依赖
+# 只改代码时保持 INSTALL_DEPS=0，构建不联网
+RUN set -eux; \
+    if [ "${INSTALL_DEPS}" = "1" ]; then \
+        unset PIP_NO_INDEX; \
+        PIP_IDX=""; \
+        if [ -n "${PIP_INDEX_URL}" ]; then PIP_IDX="-i ${PIP_INDEX_URL}"; fi; \
+        python -m pip install ${PIP_IDX} -r /app/requirements.txt; \
+    else \
+        echo "跳过依赖安装（INSTALL_DEPS=${INSTALL_DEPS}）"; \
+    fi
+
+# ---------------------------------------------------------------- 构建期自检
+# 1) 语法编译：本地没有 Python 环境时，这一步能提前抓出语法错误。
+#    只校验本次改动相关的文件——对整个 clearvoice 包做 compileall 可能因包内
+#    其它未被引用的遗留文件误报，反而阻断构建
+# 2) import 校验：确认推理包可正常导入
+# 3) 改动落地校验：确认本次的加速开关确实打进了代码和配置，
+#    避免"COPY 了旧代码却不自知"——这类问题跑起来才发现的话极难排查
+RUN set -eux; \
+    python -m compileall -q /app/app; \
+    python -m py_compile /opt/clearvoice/clearvoice/utils/decode.py; \
+    PYTHONPATH=/opt/clearvoice python -c "import clearvoice; print('clearvoice package ok')"; \
+    grep -q "batch_chunks" /opt/clearvoice/clearvoice/utils/decode.py; \
+    grep -q "fp16" /app/config/config.yaml; \
+    grep -q "batch_chunks" /app/config/config.yaml; \
+    grep -q "batch_chunks" /app/app/settings.py; \
+    echo "加速开关自检通过：decode.py / config.yaml / settings.py 均已包含新参数"; \
+    ffmpeg -version | head -n 1
+
+EXPOSE 8000
+
+HEALTHCHECK --interval=30s --timeout=10s --start-period=180s --retries=3 \
+    CMD curl -fsS http://127.0.0.1:8000/health || exit 1
+
+ENTRYPOINT ["/app/entrypoint.sh"]
