@@ -220,6 +220,24 @@ class DenoiseEngine:
         if self.cfg.runtime.one_time_decode_length_s and self.cfg.runtime.one_time_decode_length_s > 0:
             model.args.one_time_decode_length = float(self.cfg.runtime.one_time_decode_length_s)
 
+        # 推理加速开关（目前只对 MossFormerGAN_SE_16K 生效）：
+        #   batch_chunks>0  长音频分段解码时把多个窗口合并为一个 mini-batch 前向
+        #   fp16=True       模型权重与输入切 FP16(.half())，喂饱 T4 的 TensorCore
+        use_fp16 = bool(self.cfg.runtime.fp16)
+        batch_chunks = int(self.cfg.runtime.batch_chunks or 0)
+        if model_name == "MossFormerGAN_SE_16K":
+            model.args.fp16 = use_fp16
+            model.args.batch_chunks = max(0, batch_chunks)
+        else:
+            if use_fp16 or batch_chunks > 0:
+                self.logger.warning(
+                    "runtime.fp16 / runtime.batch_chunks 目前仅支持 MossFormerGAN_SE_16K，"
+                    "对 %s 不生效（已忽略）",
+                    model_name,
+                )
+            model.args.fp16 = False
+            model.args.batch_chunks = 0
+
         slot = ModelSlot(
             index=index,
             name=model_name,
@@ -228,12 +246,15 @@ class DenoiseEngine:
             model=model,
         )
         self.logger.info(
-            "模型实例就绪 name=%s index=%d device=%s sampling_rate=%d decode_window=%s 耗时=%.2fs",
+            "模型实例就绪 name=%s index=%d device=%s sampling_rate=%d decode_window=%s "
+            "fp16=%s batch_chunks=%d 耗时=%.2fs",
             model_name,
             index,
             getattr(model, "device", "?"),
             sampling_rate,
             getattr(model.args, "decode_window", "?"),
+            use_fp16,
+            batch_chunks,
             time.monotonic() - started,
         )
         return slot

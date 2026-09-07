@@ -199,6 +199,11 @@ def decode_one_audio_mossformergan_se_16k(model, device, inputs, args):
     depending on the length of the input. The `_decode_one_audio_mossformergan_se_16k` 
     function is called to perform the model inference and return the enhanced audio output.
 
+    加速扩展（均由模型 args 控制，默认关闭，不影响原语义）：
+    * args.batch_chunks > 0 —— 分段解码时把多个窗口合并为一个 mini-batch 前向，
+      摊薄 Python 循环与 CPU-GPU 搬运开销；逐窗口语义与原版完全一致。
+    * args.fp16 = True —— 模型权重与输入统一切 FP16(.half())，喂饱 T4 等显卡的 TensorCore。
+
     Args:
         model (nn.Module): The trained MossFormerGAN model used for decoding.
         device (torch.device): The device (CPU or GPU) for computation.
@@ -228,7 +233,13 @@ def decode_one_audio_mossformergan_se_16k(model, device, inputs, args):
 
     # Process the inputs in segments if necessary
     if decode_do_segment:
-        outputs = np.zeros(t)  # Initialize the output array
+        batch_chunks = int(getattr(args, "batch_chunks", 0) or 0)
+        if batch_chunks > 0:
+            return _decode_mossformergan_se_16k_segmented_batch(
+                model, device, inputs, norm_factor, args, batch_chunks
+            )
+
+        outputs = np.zeros(t, dtype=np.float32)  # Initialize the output array
         give_up_length = (window - stride) // 2  # Calculate length to give up at each segment
         current_idx = 0  # Initialize current index for segmentation
 
@@ -247,7 +258,7 @@ def decode_one_audio_mossformergan_se_16k(model, device, inputs, args):
         # Handle the remaining part of the input if it doesn't fit into a full segment
         # current_idx > t - window
         if current_idx < t:
-            last_start = current_idx - give_up_length # shift left by give_up_length
+            last_start = current_idx - give_up_length  # shift left by give_up_length
             tmp_input = inputs[:, last_start:]
             tmp_output = _decode_one_audio_mossformergan_se_16k(model, device, tmp_input, norm_factor, args)
             outputs[current_idx:] = tmp_output[give_up_length:]  # Fill the remaining part of the output
@@ -255,6 +266,117 @@ def decode_one_audio_mossformergan_se_16k(model, device, inputs, args):
     else:
         # If no segmentation is required, process the entire input
         return _decode_one_audio_mossformergan_se_16k(model, device, inputs, norm_factor, args)  # Inference on full input
+
+
+def _mossformergan_model_forward(model, device, inputs_spec, args):
+    """跑一次模型前向。args.fp16 开启且输入在 CUDA 上时，把模型权重与输入频谱
+    统一切成 FP16（首次调用时惰性转换一次），让 T4/L4 等显卡吃到 TensorCore。
+
+    注意不能只用 torch.autocast：模型内部有自定义 LayerNorm 的 FP32 参数与 conv
+    的 FP16 输出相加、以及 torch.cat 拼接，半精度下会 dtype 不一致而报错，因此必须
+    权重与输入同时 .half()。返回前统一转回 float32，避免下游 power_uncompress /
+    torch.complex 遇到 FP16 精度/支持问题时出错。
+    """
+    use_fp16 = bool(getattr(args, "fp16", False)) and inputs_spec.is_cuda
+    if use_fp16:
+        if not getattr(model, "_cv_fp16_enabled", False):
+            model.half()
+            model._cv_fp16_enabled = True
+        out_list = model(inputs_spec.half())
+    else:
+        out_list = model(inputs_spec)
+    return out_list[0].float(), out_list[1].float()
+
+
+@torch.no_grad()
+def _decode_mossformergan_se_16k_segmented_batch(
+    model, device, inputs, norm_factor, args, batch_chunks
+):
+    """MossFormerGAN_SE_16K 长音频分段推理的 batch 加速版。
+
+    逐窗口语义与原版完全一致（窗口切分、overlap-add、全局归一化因子均不变），
+    区别只在于把 batch_chunks 个窗口拼成一个 mini-batch 一次性前向。模型内部所有
+    归一化均为逐样本 InstanceNorm/LayerNorm，窗口之间互不干扰，因此 batch 前向
+    与逐段前向结果一致。显存不足时自动退回 batch=1，保证可用。
+    """
+    t = inputs.size(-1)
+    window = int(args.sampling_rate * args.decode_window)
+    stride = int(window * 0.75)
+    give_up = (window - stride) // 2
+
+    if window <= 0 or window >= t:
+        # decode_window 大于音频等异常参数：退化到整段单次前向
+        return _decode_one_audio_mossformergan_se_16k(model, device, inputs, norm_factor, args)
+
+    starts = []
+    cur = 0
+    while cur + window <= t:
+        starts.append(cur)
+        cur += stride
+
+    if not starts:
+        return _decode_one_audio_mossformergan_se_16k(model, device, inputs, norm_factor, args)
+
+    outputs = np.zeros(t, dtype=np.float32)
+    batch_chunks = max(1, int(batch_chunks))
+
+    def run_batch(starts_batch):
+        n = len(starts_batch)
+        chunk = torch.empty(n, window, dtype=inputs.dtype, device=inputs.device)
+        for idx, s in enumerate(starts_batch):
+            chunk[idx].copy_(inputs[0, s:s + window])
+        chunk = chunk * norm_factor
+        spec = stft(chunk, args, center=True, periodic=True, onesided=True).to(torch.float32)
+        spec = power_compress(spec).permute(0, 1, 3, 2)
+        pred_real, pred_imag = _mossformergan_model_forward(model, device, spec, args)
+        pred_real = pred_real.permute(0, 1, 3, 2)
+        pred_imag = pred_imag.permute(0, 1, 3, 2)
+        spec = power_uncompress(pred_real, pred_imag).squeeze(1)
+        time_audio = istft(spec, args, center=True, periodic=True, onesided=True)
+        time_audio = time_audio / norm_factor
+        # 与原版 _decode_one_audio_mossformergan_se_16k 的 outputs[:input_len] 对齐：
+        # 每个全窗口的 input_len 恰为 window，多出来的重建尾巴一并裁掉
+        return time_audio[:, :window].detach().cpu().numpy()
+
+    def write_batch(starts_batch, rows):
+        for j, s in enumerate(starts_batch):
+            row = rows[j]
+            if s == 0:
+                outputs[s:s + window - give_up] = row[:window - give_up]
+            else:
+                outputs[s + give_up:s + window - give_up] = row[give_up:window - give_up]
+
+    n_starts = len(starts)
+    try:
+        i = 0
+        while i < n_starts:
+            group = starts[i:i + batch_chunks]
+            write_batch(group, run_batch(group))
+            i += len(group)
+    except torch.cuda.OutOfMemoryError:
+        # 显存不够时退回 batch=1 重跑，保证长音频仍可用
+        import gc
+
+        gc.collect()
+        torch.cuda.empty_cache()
+        outputs[:] = 0.0
+        batch_chunks = 1
+        i = 0
+        while i < n_starts:
+            group = starts[i:i + batch_chunks]
+            write_batch(group, run_batch(group))
+            i += len(group)
+
+    if cur < t:
+        last_start = cur - give_up
+        if last_start >= 0:
+            tmp_input = inputs[:, last_start:]
+            tmp_output = _decode_one_audio_mossformergan_se_16k(model, device, tmp_input, norm_factor, args)
+            outputs[cur:] = tmp_output[give_up:]
+        else:
+            # cur < give_up 说明窗口比音频还长（异常参数），上面已退化处理
+            return _decode_one_audio_mossformergan_se_16k(model, device, inputs, norm_factor, args)
+    return outputs
 
 @torch.no_grad()
 def _decode_one_audio_mossformergan_se_16k(model, device, inputs, norm_factor, args):
@@ -298,8 +420,8 @@ def _decode_one_audio_mossformergan_se_16k(model, device, inputs, norm_factor, a
     inputs_spec = power_compress(inputs_spec).permute(0, 1, 3, 2)
 
     # Pass the compressed spectrogram through the model to get predicted real and imaginary parts
-    out_list = model(inputs_spec)
-    pred_real, pred_imag = out_list[0].permute(0, 1, 3, 2), out_list[1].permute(0, 1, 3, 2)
+    pred_real, pred_imag = _mossformergan_model_forward(model, device, inputs_spec, args)
+    pred_real, pred_imag = pred_real.permute(0, 1, 3, 2), pred_imag.permute(0, 1, 3, 2)
 
     # Uncompress the predicted spectrogram to get the magnitude and phase
     pred_spec_uncompress = power_uncompress(pred_real, pred_imag).squeeze(1)

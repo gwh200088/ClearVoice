@@ -31,6 +31,8 @@ ENV_ALIASES = {
     "CV_DECODE_WINDOW_S": "runtime.decode_window_s",
     "CV_ONE_TIME_DECODE_LENGTH_S": "runtime.one_time_decode_length_s",
     "CV_PROCESS_MEMORY_RATIO": "runtime.process_memory_ratio",
+    "CV_FP16": "runtime.fp16",
+    "CV_BATCH_CHUNKS": "runtime.batch_chunks",
     "CV_MAX_CONCURRENCY": "concurrency.max_concurrency",
     "CV_MAX_QUEUE_SIZE": "concurrency.max_queue_size",
     "CV_QUEUE_TIMEOUT_S": "concurrency.queue_timeout_s",
@@ -79,6 +81,9 @@ class RuntimeConfig:
     decode_window_s: float = 0.0
     one_time_decode_length_s: float = 0.0
     process_memory_ratio: float = 0.0
+    # 长音频分段推理时一次 forward 合并的窗口数（0=关闭），并把模型权重/输入切到 FP16
+    fp16: bool = False
+    batch_chunks: int = 0
 
 
 @dataclass

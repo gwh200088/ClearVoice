@@ -28,6 +28,13 @@ runtime:
   one_time_decode_length_s: 0.0
   # 0 表示不设置硬上限；>0 时调用 torch.cuda.set_per_process_memory_fraction 兜底
   process_memory_ratio: 0.0
+  # ---- 推理加速（仅对 MossFormerGAN_SE_16K 生效）----
+  # 模型权重与输入切 FP16(.half())，T4/L4 等显卡吃满 TensorCore，通常快 1.5~2 倍。
+  # 若对比原始音频发现可闻噪声/失真差异，可改回 false 用 FP32。
+  fp16: true
+  # 长音频分段解码时一次 forward 合并的窗口数（默认窗口 10s / 步长 7.5s）。
+  # 0 = 关闭（一次只推一段）；越大 GPU 利用率越高、越吃显存，建议 4~8，显存不足会自动退回 1。
+  batch_chunks: 8
 
 concurrency:
   max_concurrency: 2

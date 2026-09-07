@@ -391,8 +391,8 @@ CPU 模式同理：以 `psutil.virtual_memory().available - reserve_mb` 为可�
 
 | 场景 | 建议 |
 |---|---|
-| T4 16GB | `max_concurrency=2`、`model_pool_size=2`、`per_task_mb=1024`、`reserve_mb=512` |
-| 显存被打满/出现 OOM | 调小 `runtime.decode_window_s`（如 16k 模型设 2~4，48k 模型设 1~2）以降低单段解码峰值；或调大 `per_task_mb` |
+| T4 16GB | `max_concurrency=2`、`model_pool_size=2`、`per_task_mb=1024`、`reserve_mb=512`；MossFormerGAN 建议 `fp16=true` + `batch_chunks=4~8`（默认已开） |
+| 显存被打满/出现 OOM | 调小 `runtime.batch_chunks`（如 2~4）或 `runtime.decode_window_s`（如 16k 模型设 2~4，48k 模型设 1~2）以降低单段解码峰值；或调大 `per_task_mb` |
 | 想与其它进程安全共享 GPU | 调小 `max_usage_ratio`、调大 `reserve_mb` |
 | 显存紧张但不希望排队太久 | 调大 `count_cached_as_free=false` 转保守口径，或减小 `max_concurrency` |
 
@@ -429,8 +429,13 @@ CPU 模式同理：以 `psutil.virtual_memory().available - reserve_mb` 为可�
 CPU 数值仅供下限参考；T4 上通常快 20~50 倍，实际以 `/api/v1/status` 或响应头 `X-Processing-Ms` 为准。
 
 短音频（≤10s）一次性推理，不会补零浪费算力；超过 10s 按 10s 窗口、7.5s 步长带重叠拼接，
-因此 30s 音频的实际计算量约为其长度的 1.3 倍。若显存紧张或想提速，可把
-`runtime.decode_window_s` 调小（如 4~6）以缩小分段窗口。
+因此 30s 音频的实际计算量约为其长度的 1.3 倍。
+
+**GPU 长音频加速**（默认开启，仅 MossFormerGAN_SE_16K）：
+`runtime.fp16` 把模型权重与输入切到 FP16(.half())，`runtime.batch_chunks` 把多个窗口合并为一个
+mini-batch 一次前向（窗口间逐样本归一化、互不干扰，结果与逐段前向一致）。两者配合能把 T4 上
+长音频推理耗时通常压到原来的 1/3~1/2。若显存紧张可调小 `batch_chunks`，出现 OOM 会自动退回逐段；
+对比原始音频发现可闻差异时把 `fp16` 改回 false。
 
 ### SNR 阈值怎么标定
 
@@ -454,7 +459,8 @@ CPU 数值仅供下限参考；T4 上通常快 20~50 倍，实际以 `/api/v1/st
 * 嵌套写法：`CV_SECTION__KEY`，例如 `CV_CONCURRENCY__MAX_CONCURRENCY=4`、`CV_LOGGING__MAX_BYTES=10485760`
 * 常用扁平别名：`CV_DEVICE`、`CV_GPU_IDS`、`CV_MODEL`、`CV_MODEL_POOL_SIZE`、`CV_MAX_CONCURRENCY`、
   `CV_MAX_QUEUE_SIZE`、`CV_MODEL_ROOT`、`CV_API_KEY`、`CV_PORT`、`CV_TEMP_DIR`、`CV_AUTO_DETECT`、
-  `CV_SNR_THRESHOLD_DB`、`CV_LOG_DIR`、`CV_LOG_LEVEL`、`CV_LOG_MAX_BYTES`、`CV_LOG_BACKUP_COUNT`、`CV_DECODE_WINDOW_S`
+  `CV_SNR_THRESHOLD_DB`、`CV_LOG_DIR`、`CV_LOG_LEVEL`、`CV_LOG_MAX_BYTES`、`CV_LOG_BACKUP_COUNT`、`CV_DECODE_WINDOW_S`、
+  `CV_FP16`、`CV_BATCH_CHUNKS`
 
 ### 主要配置项
 
@@ -470,6 +476,8 @@ CPU 数值仅供下限参考；T4 上通常快 20~50 倍，实际以 `/api/v1/st
 | `runtime.auto_select_model` | true | 输入采样率 >= 32kHz 时自动切到 48k 模型 |
 | `runtime.model_pool_size` | 2 | 模型实例数（决定真实并行度） |
 | `runtime.decode_window_s` | 0（用模型默认） | 单段解码长度，调小可降低显存峰值 |
+| `runtime.fp16` | true | MossFormerGAN_SE_16K 前向切 FP16(autocast)，吃满 T4/L4 TensorCore（提速主开关） |
+| `runtime.batch_chunks` | 8 | 长音频分段解码时一次 forward 合并的窗口数，0=关闭；越大越吃显存，OOM 会自动退回 1 |
 | `concurrency.max_concurrency` | 2 | 同时推理任务数 |
 | `concurrency.max_queue_size` | 64 | 排队任务上限 |
 | `resource.gpu.reserve_mb` | 512 | 常驻预留显存 |
